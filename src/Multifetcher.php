@@ -3,16 +3,20 @@
 namespace Marmelab\Multifetch;
 
 use KzykHys\Parallel\Parallel;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Exception\HttpException;
+use Symfony\Component\HttpKernel\HttpKernelInterface;
 
 class Multifetcher
 {
-    public function fetch(array $parameters, $renderer, array $options = array())
+    public function fetch($app, array $options = [])
     {
-        $options = array_replace(array(
+        $parameters = $app['request']->request->all();
+        $options = array_replace([
             'parallel' => false,
             'headers' => true,
-        ), $options);
+        ], $options);
 
         foreach ($options as $name => $value) {
             if (isset($parameters['_'.$name])) {
@@ -28,38 +32,57 @@ class Multifetcher
             );
         }
 
-        $requests = array();
-        foreach ($parameters as $resource => $url) {
-            $requests[$resource] = function () use ($resource, $url, $renderer) {
+        $requests = [];
+        foreach ($parameters as $requestParams) {
+
+            $this->checkRequestParams($requestParams);
+            $request = $this->formatRequest($app, $requestParams);
+            $relativeUrl = $requestParams['relative_url'];
+
+            $requests[] = function ()
+            use ($relativeUrl, $request, $app) {
                 try {
-                    $response = $renderer($url);
+                    /** @var Response $response */
+                    $response = $this->makeSubRequest($app, $request);
+
+                    $code = $response->getStatusCode();
+                    $headers = $this->formatHeaders($response->headers->all());
+                    $body = $response->getContent();
 
                 } catch (HttpException $e) {
                     $reflectionClass = new \ReflectionClass($e);
                     $type = $reflectionClass->getShortName();
 
-                    return array(
-                        'code' => $e->getStatusCode(),
-                        'headers' => $this->formatHeaders($e->getHeaders()),
-                        'body' => json_encode(array('error' => $e->getMessage(), 'type' => $type)),
+                    $code = $e->getStatusCode();
+                    $headers = $this->formatHeaders($e->getHeaders());
+                    $body = json_encode(
+                        [
+                            'error' => $e->getMessage(),
+                            'type'  => $type
+                        ]
                     );
+
                 } catch (\Exception $e) {
 
-                    return array(
-                        'code' => 500,
-                        'headers' => array(),
-                        'body' => json_encode(array('error' => $e->getMessage(), 'type' => 'InternalServerError')),
+                    $code = 500;
+                    $headers = [];
+                    $body = json_encode(
+                        [
+                            'error' => $e->getMessage(),
+                            'type'  => 'InternalServerError'
+                        ]
                     );
                 }
 
-                return array(
-                    'code' => $response->getStatusCode(),
-                    'headers' => $this->formatHeaders($response->headers->all()),
-                    'body' => $response->getContent(),
-                );
+                return [
+                    'code' => $code,
+                    'headers' => $headers,
+                    'body' => $body
+                ];
             };
         }
 
+        $responses = [];
         if ($options['parallel']) {
             $parallel = new Parallel();
 
@@ -85,5 +108,53 @@ class Multifetcher
         return array_map(function ($name, $value) {
             return array('name' => $name, 'value' => current($value));
         }, array_keys($headers), $headers);
+    }
+
+    /**
+     * @param array $requestParams
+     *
+     * @return Request
+     */
+    private function formatRequest($app, array $requestParams)
+    {
+        $method = strtoupper($requestParams['method']);
+        $relativeUrl = $requestParams['relative_url'];
+        $server = $app['request']->server->all();
+        $headers = isset($requestParams['headers'])?$requestParams['headers']:[];
+
+        $body = isset($requestParams['body']) ? $requestParams['body'] : [];
+        $request = Request::create(
+            $relativeUrl,
+            $method,
+            $body,
+            [],
+            [],
+            $server
+        );
+
+        $request->headers->add($headers);
+
+        return $request;
+    }
+
+    private function checkRequestParams(array $requestParams)
+    {
+        if(!isset($requestParams['relative_url'])) {
+            throw new HttpException(400, 'relative_url param should exist');
+        }
+        if(!isset($requestParams['method'])) {
+            throw new HttpException(400, 'method param should exist');
+        }
+    }
+
+    private function makeSubRequest($app, $request)
+    {
+        $response = $app->handle(
+            $request,
+            HttpKernelInterface::SUB_REQUEST,
+            true
+        );
+
+        return $response;
     }
 }
